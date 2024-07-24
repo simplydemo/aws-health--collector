@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "This CloudFormation template listens for the 'aws.health' event sent by the EventBus Sender for each member account provisioned as 'sender-org-stacks' in AWS Organizations. Additionally, received events are sent to SNS topics and sent to Hangout Chat through Lambda subscribers."
+
+Parameters:
+  Project:
+    Type: String
+    MinLength: '3'
+    MaxLength: '8'
+    Description: Project name (3-8 characters)
+    Default: cops
+  Region:
+    Type: String
+    Description: AWS Region
+    AllowedValues:
+      - ap-northeast-2
+      - us-east-1
+      - us-west-2
+    Default: ap-northeast-2
+  ECRImageUri:
+    Type: String
+    Description: AWS Health Event Notifier Image
+  GchatWebhookUrl:
+    Type: String
+    Description: Google Chat Webhook URL
+  OrgId:
+    Type: String
+    MinLength: '4'
+    MaxLength: '16'
+    Description: Organization ID to allow events from.
+  Owner:
+    Type: String
+    Description: Resource owner
+  Team:
+    Type: String
+    Description: Team name
+    Default: PEOps
+
+Resources:
+  DelibirdLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${Project}-health-delibird-lambda
+      PackageType: Image
+      Architectures:
+        - arm64
+      MemorySize: 256
+      Timeout: 300
+      Code:
+        ImageUri: !Ref ECRImageUri
+      Role: !GetAtt DelibirdLambdaRole.Arn
+      Environment:
+        Variables:
+          GCHAT_WEBHOOK_URL: !Ref GchatWebhookUrl
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}-health-delibird-lambda
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Team
+          Value: !Ref Team
+
+  DelibirdLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Project}HealthDelibirdLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub ${Project}LambdaExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: "Allow"
+                Action:
+                  - "ecr:*"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "kms:Decrypt"
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}HealthDelibirdLambdaRole
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Team
+          Value: !Ref Team
+
+  HealthKMS:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for SNS encryption
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: 'key-default-1'
+        Statement:
+          - Sid: 'Enable IAM User Permissions'
+            Effect: 'Allow'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: 'Allow EventBridge to use the key'
+            Effect: 'Allow'
+            Principal:
+              Service: 'events.amazonaws.com'
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}-health-kms
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Team
+          Value: !Ref Team
+
+  HealthKMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${Project}-health-kms
+      TargetKeyId: !Ref HealthKMS
+
+  HealthTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${Project}-aws-health-topic
+      KmsMasterKeyId: !Ref HealthKMSAlias
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}-health-topic
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Team
+          Value: !Ref Team
+
+  HealthTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref HealthTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "__default_statement_ID"
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - SNS:GetTopicAttributes
+              - SNS:SetTopicAttributes
+              - SNS:AddPermission
+              - SNS:RemovePermission
+              - SNS:DeleteTopic
+              - SNS:Subscribe
+              - SNS:ListSubscriptionsByTopic
+              - SNS:Publish
+            Resource: !Ref HealthTopic
+            Condition:
+              StringEquals:
+                AWS:SourceOwner: !Ref AWS::AccountId
+          - Sid: "AllowEventBridgeToPublish"
+            Effect: "Allow"
+            Principal:
+              Service: "events.amazonaws.com"
+            Action: "sns:Publish"
+            Resource: !Ref HealthTopic
+
+  HealthTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref HealthTopic
+      Protocol: lambda
+      Endpoint: !GetAtt DelibirdLambda.Arn
+
+  HealthEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub ${Project}-health-collector-bus
+      Description: "Receive all aws.health events and notify to sns topic."
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}-health-collector-bus
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Team
+          Value: !Ref Team
+
+  HealthEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref HealthEventBus
+      StatementId: "AllowPutHealthEvents"
+      Statement:
+          Effect: "Allow"
+          Principal: "*"
+          Action: "events:PutEvents"
+          Resource: !GetAtt HealthEventBus.Arn
+
+  HealthEventBusOrgPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref HealthEventBus
+      StatementId: "AllowPutHealthEventsForOrganizationId"
+      Statement:
+          Effect: "Allow"
+          Principal: "*"
+          Action: "events:PutEvents"
+          Resource: !GetAtt HealthEventBus.Arn
+          Condition:
+            StringEquals:
+              "aws:PrincipalOrgID": !Ref OrgId
+
+  HealthProcessorRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${Project}-health-processor-rule
+      Description: "Notify all aws.health events to sns topic"
+      EventBusName: !Ref HealthEventBus
+      EventPattern:
+        source:
+          - aws.health
+          - custom.health
+      Targets:
+        - Arn: !Ref HealthTopic
+          Id: HealthTopicTarget
+      State: "ENABLED"
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DelibirdLambda
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref HealthTopic
+
+Outputs:
+  LambdaArn:
+    Description: ARN of the Delibird Lambda Function
+    Value: !GetAtt DelibirdLambda.Arn
+  SNSTopicArn:
+    Description: ARN of the Health SNS Topic
+    Value: !Ref HealthTopic
+  EventBusArn:
+    Description: ARN of the Health Event Bus
+    Value: !GetAtt HealthEventBus.Arn
+  ECRArn:
+    Description: ARN of the ECR
+    Value: !Select [0, !Split [":", !Ref ECRImageUri]]

@@ -1,0 +1,68 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EventBridge rule to forward AWS Health events to Data Collector account'
+
+Parameters:
+  Project:
+    Type: String
+    MinLength: '3'
+    MaxLength: '8'
+    Description: Project name (3-8 characters)
+    Default: 'cops'
+  CollectorEventBusArn:
+    Type: String
+    Description: 'ARN of the target event bus'
+  Team:
+    Type: String
+    Description: Team name
+    Default: PEOps
+
+Resources:
+  HealthEventForwardingRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub ${Project}HealthEventForwardingRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: !Sub ${Project}EventBridgePutEventsMemberPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'events:PutEvents'
+                Resource: !Ref CollectorEventBusArn
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}HealthEventForwardingRole
+        - Key: Project
+          Value: !Ref Project
+        - Key: Team
+          Value: !Ref Team
+
+
+  HealthEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub ${Project}-health-deliver-rule
+      Description: 'Forward AWS Health events to data-collector account'
+      EventPattern:
+        source:
+          - 'aws.health'
+      State: 'ENABLED'
+      Targets:
+        - Arn: !Ref CollectorEventBusArn
+          Id: 'ForwardToCollectorEventBus'
+          RoleArn: !GetAtt HealthEventForwardingRole.Arn
+
+Outputs:
+  RuleArn:
+    Description: 'ARN of the created EventBridge rule'
+    Value: !GetAtt HealthEventRule.Arn
+  RoleArn:
+    Description: 'ARN of the IAM role for event forwarding'
+    Value: !GetAtt HealthEventForwardingRole.Arn
