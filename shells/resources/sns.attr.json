@@ -1,0 +1,6 @@
+{
+  "event_type": {
+    "DataType": "String",
+    "StringValue": "aws.health"
+  }
+}
